@@ -262,11 +262,11 @@ def find_pid():
         pass
     return None
 
-def proxy_test(timeout=10):
+def proxy_test(timeout=30):
     try:
         r = run([
             "curl", "--proxy", f"http://{HOST}:{PORT}",
-            "--connect-timeout", "5", "--max-time", str(timeout),
+            "--connect-timeout", "10", "--max-time", str(timeout),
             "-L", "-o", "/dev/null", "-s", "-w", "%{http_code}",
             "https://github.com"
         ], capture=True)
