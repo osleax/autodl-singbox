@@ -262,17 +262,26 @@ def find_pid():
         pass
     return None
 
-def proxy_test(timeout=30):
-    try:
-        r = run([
-            "curl", "--proxy", f"http://{HOST}:{PORT}",
-            "--connect-timeout", "10", "--max-time", str(timeout),
-            "-L", "-o", "/dev/null", "-s", "-w", "%{http_code}",
-            "https://github.com"
-        ], capture=True)
-        return r.returncode == 0 and r.stdout.strip() in ("200", "301", "302")
-    except FileNotFoundError:
-        return False
+def proxy_test(timeout=15, retries=3):
+    for attempt in range(retries):
+        try:
+            r = run([
+                "curl", "--proxy", f"http://{HOST}:{PORT}",
+                "--connect-timeout", "10", "--max-time", str(timeout),
+                "-L", "-o", "/dev/null", "-s", "-w", "%{http_code}",
+                "https://github.com"
+            ], capture=True)
+
+            if r.returncode == 0 and r.stdout.strip() in ("200", "301", "302"):
+                return True
+
+        except FileNotFoundError:
+            return False
+
+        if attempt < retries - 1:
+            time.sleep(1)
+
+    return False
 
 def check_config(path=CONFIG):
     b = ensure_binary()
