@@ -1,0 +1,704 @@
+#!/usr/bin/env python3
+# sb - AutoDL sing-box manager
+# Requires: Python 3, curl, git (for git-on/off), and sing-box binary.
+
+import base64
+import platform
+import re
+import tarfile
+import getpass
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+SB_VERSION = "1.1.0-autodl"
+HOST = "127.0.0.1"
+PORT = 1080
+TEST_PORT = 19080
+TEST_BYTES = 5_000_000
+
+SYSTEM_SB = Path("/usr/local/bin/sb")
+SYSTEM_BIN = Path("/usr/local/bin/sing-box")
+CONFIG_DIR = Path("/etc/sing-box")
+CONFIG = CONFIG_DIR / "config.json"
+BACKUP = CONFIG_DIR / "config.json.bak"
+LOGFILE = Path("/var/log/sing-box.log")
+PIDFILE = Path("/run/sing-box.pid")
+
+def run(cmd, capture=False, check=False, **kwargs):
+    if capture:
+        return subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, check=check, **kwargs)
+    return subprocess.run(cmd, check=check, **kwargs)
+
+def is_root():
+    return os.geteuid() == 0
+
+def require_root():
+    if not is_root():
+        print("✗ 此命令需要 root 权限。")
+        sys.exit(1)
+
+def current_script():
+    return Path(__file__).resolve()
+
+def binary_path():
+    # Installed mode.
+    if SYSTEM_BIN.exists():
+        return SYSTEM_BIN
+    # Portable/pre-install mode: sing-box beside sb.
+    p = current_script().parent / "sing-box"
+    if p.exists():
+        return p
+    return SYSTEM_BIN
+
+def ensure_binary():
+    p = binary_path()
+    if not p.is_file():
+        print(f"✗ 找不到 sing-box：{p}")
+        print("首次安装时，请把 sb 和 sing-box 放在同一个目录后运行：")
+        print("  chmod +x sb sing-box")
+        print("  ./sb install")
+        sys.exit(1)
+    if not os.access(p, os.X_OK):
+        try:
+            p.chmod(p.stat().st_mode | 0o111)
+        except Exception:
+            pass
+    return p
+
+def autodl_turbo_env():
+    """Load AutoDL /etc/network_turbo into a subprocess environment."""
+    env = os.environ.copy()
+    turbo = Path("/etc/network_turbo")
+    if not turbo.exists():
+        return env, False
+    try:
+        r = subprocess.run(
+            ["bash", "-lc", "source /etc/network_turbo >/dev/null 2>&1; env -0"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+        for item in r.stdout.split(b"\0"):
+            if b"=" in item:
+                k, v = item.split(b"=", 1)
+                env[k.decode(errors="ignore")] = v.decode(errors="ignore")
+        return env, True
+    except Exception:
+        return env, False
+
+def autodl_arch():
+    m = platform.machine().lower()
+    if m in ("x86_64", "amd64"):
+        return "amd64"
+    if m in ("aarch64", "arm64"):
+        return "arm64"
+    raise RuntimeError(f"暂不支持的 CPU 架构：{m}")
+
+def latest_stable_version(env):
+    # GitHub API: releases/latest excludes prereleases.
+    api = "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+    req = urllib.request.Request(api, headers={
+        "User-Agent": "autodl-singbox-sb",
+        "Accept": "application/vnd.github+json"
+    })
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({
+            "http": env.get("http_proxy") or env.get("HTTP_PROXY"),
+            "https": env.get("https_proxy") or env.get("HTTPS_PROXY"),
+        })
+    )
+    with opener.open(req, timeout=60) as r:
+        obj = json.loads(r.read().decode("utf-8"))
+    tag = obj.get("tag_name", "")
+    if not re.fullmatch(r"v?\d+\.\d+\.\d+", tag):
+        raise RuntimeError(f"无法识别稳定版本：{tag}")
+    return tag.lstrip("v")
+
+def download_sing_box(dest):
+    arch = autodl_arch()
+    env, turbo = autodl_turbo_env()
+    if turbo:
+        print("✓ 检测到 AutoDL 学术资源加速 /etc/network_turbo")
+        print("  将仅用于本次官方 sing-box 下载。")
+    else:
+        print("⚠ 未检测到 /etc/network_turbo，将直接访问 GitHub。")
+
+    print("查询 sing-box 官方最新稳定版...")
+    version = latest_stable_version(env)
+    print(f"✓ 最新稳定版：{version}")
+
+    filename = f"sing-box-{version}-linux-{arch}.tar.gz"
+    url = f"https://github.com/SagerNet/sing-box/releases/download/v{version}/{filename}"
+
+    with tempfile.TemporaryDirectory(prefix="sb-install-") as td:
+        archive = Path(td) / filename
+        print(f"下载官方 sing-box ({arch})...")
+        r = subprocess.run(
+            ["curl", "-fL", "--retry", "3", "--connect-timeout", "15",
+             "-o", str(archive), url],
+            env=env
+        )
+        if r.returncode != 0:
+            raise RuntimeError("sing-box 下载失败")
+
+        print("解压...")
+        with tarfile.open(archive, "r:gz") as tf:
+            tf.extractall(td)
+
+        candidates = [
+            p for p in Path(td).rglob("sing-box")
+            if p.is_file()
+        ]
+        if not candidates:
+            raise RuntimeError("压缩包中未找到 sing-box")
+
+        shutil.copy2(candidates[0], dest)
+        dest.chmod(0o755)
+
+    # Validate downloaded binary.
+    r = subprocess.run([str(dest), "version"])
+    if r.returncode != 0:
+        try:
+            dest.unlink()
+        except Exception:
+            pass
+        raise RuntimeError("下载的 sing-box 无法运行")
+
+def install():
+    require_root()
+    src_sb = current_script()
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    SYSTEM_SB.parent.mkdir(parents=True, exist_ok=True)
+
+    # Install/update sb itself.
+    if src_sb != SYSTEM_SB:
+        shutil.copy2(src_sb, SYSTEM_SB)
+    SYSTEM_SB.chmod(0o755)
+
+    # Prefer a binary beside sb if the user already supplied one.
+    local_bin = src_sb.parent / "sing-box"
+    try:
+        if local_bin.is_file() and local_bin.resolve() != SYSTEM_BIN.resolve():
+            print("发现当前目录已有 sing-box，直接安装。")
+            shutil.copy2(local_bin, SYSTEM_BIN)
+            SYSTEM_BIN.chmod(0o755)
+        elif SYSTEM_BIN.is_file():
+            print("✓ 已存在 sing-box，保留当前版本。")
+        else:
+            download_sing_box(SYSTEM_BIN)
+    except Exception as e:
+        print(f"✗ sing-box 安装失败：{e}")
+        print("sb 已安装，但 sing-box 尚未就绪。")
+        print("可检查 AutoDL 网络后重新执行：sb install")
+        return
+
+    print()
+    print("✓ AutoDL 专用版安装完成")
+    print(f"  sb:       {SYSTEM_SB}")
+    print(f"  sing-box: {SYSTEM_BIN}")
+    print(f"  配置:     {CONFIG}")
+    print(f"  日志:     {LOGFILE}")
+    print()
+    print("下一步：")
+    print("  sb setup")
+
+def uninstall():
+    require_root()
+    stop(quiet=True)
+    print("将卸载程序：")
+    print(f"  {SYSTEM_SB}")
+    print(f"  {SYSTEM_BIN}")
+    ans = input("继续？[y/N]: ").strip().lower()
+    if ans not in ("y", "yes"):
+        print("已取消")
+        return
+
+    for p in (SYSTEM_SB, SYSTEM_BIN):
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+
+    ans = input(f"是否同时删除 {CONFIG_DIR} 中的配置/备份？[y/N]: ").strip().lower()
+    if ans in ("y", "yes"):
+        shutil.rmtree(CONFIG_DIR, ignore_errors=True)
+
+    try:
+        PIDFILE.unlink()
+    except FileNotFoundError:
+        pass
+
+    print("✓ 卸载完成")
+    print("日志默认保留：", LOGFILE)
+
+def find_pid():
+    try:
+        if PIDFILE.exists():
+            pid = int(PIDFILE.read_text().strip())
+            os.kill(pid, 0)
+            return pid
+    except Exception:
+        pass
+
+    try:
+        r = run(["pgrep", "-f", r"[s]ing-box.*run.*config\.json"], capture=True)
+        for s in r.stdout.split():
+            try:
+                pid = int(s)
+                os.kill(pid, 0)
+                return pid
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+def proxy_test(timeout=10):
+    try:
+        r = run([
+            "curl", "--proxy", f"http://{HOST}:{PORT}",
+            "--connect-timeout", "5", "--max-time", str(timeout),
+            "-L", "-o", "/dev/null", "-s", "-w", "%{http_code}",
+            "https://github.com"
+        ], capture=True)
+        return r.returncode == 0 and r.stdout.strip() in ("200", "301", "302")
+    except FileNotFoundError:
+        return False
+
+def check_config(path=CONFIG):
+    b = ensure_binary()
+    return run([str(b), "check", "-c", str(path)]).returncode == 0
+
+def start():
+    require_root()
+    ensure_binary()
+    if not CONFIG.is_file():
+        print(f"✗ 找不到 {CONFIG}")
+        print("请先运行：sb setup")
+        return
+
+    pid = find_pid()
+    if pid:
+        print(f"✓ sing-box 已运行，PID: {pid}")
+        print("代理正常" if proxy_test() else "⚠ 进程存在，但代理测试失败；可执行 sb restart / sb log")
+        return
+
+    print("检查配置...")
+    if not check_config():
+        print("✗ 配置检查失败")
+        return
+
+    print("启动 sing-box...")
+    LOGFILE.parent.mkdir(parents=True, exist_ok=True)
+    log = open(LOGFILE, "ab", buffering=0)
+    proc = subprocess.Popen(
+        [str(binary_path()), "run", "-c", str(CONFIG)],
+        stdout=log, stderr=log, start_new_session=True
+    )
+    PIDFILE.write_text(str(proc.pid))
+    time.sleep(2)
+
+    if proc.poll() is None:
+        print(f"✓ sing-box 启动成功，PID: {proc.pid}")
+        print(f"代理: http://{HOST}:{PORT}")
+        print("✓ GitHub 代理正常" if proxy_test() else "⚠ 已启动，但 GitHub 测试失败；运行 sb log 查看")
+    else:
+        try: PIDFILE.unlink()
+        except FileNotFoundError: pass
+        print("✗ sing-box 启动失败")
+        show_log()
+
+def stop(quiet=False):
+    require_root()
+    pid = find_pid()
+    if not pid:
+        try: PIDFILE.unlink()
+        except FileNotFoundError: pass
+        if not quiet:
+            print("sing-box 未运行")
+        return
+
+    if not quiet:
+        print(f"停止 sing-box (PID {pid})...")
+    try:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(15):
+            try:
+                os.kill(pid, 0)
+                time.sleep(0.2)
+            except ProcessLookupError:
+                break
+        try:
+            os.kill(pid, 0)
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    except ProcessLookupError:
+        pass
+    finally:
+        try: PIDFILE.unlink()
+        except FileNotFoundError: pass
+    if not quiet:
+        print("✓ sing-box 已停止")
+
+def restart():
+    stop()
+    time.sleep(0.5)
+    start()
+
+def status():
+    pid = find_pid()
+    print("========== sing-box ==========")
+    if not pid:
+        print("进程: ✗ 未运行")
+        print("==============================")
+        return
+    print("进程: ✓ 运行中")
+    print(f"PID: {pid}")
+    print(f"代理: http://{HOST}:{PORT}")
+    print("状态: ✓ 代理正常" if proxy_test() else "状态: ✗ 代理测试失败")
+    print("==============================")
+
+def test():
+    print("测试当前节点访问 GitHub...\n")
+    try:
+        subprocess.run([
+            "curl", "--proxy", f"http://{HOST}:{PORT}",
+            "--connect-timeout", "10", "--max-time", "30",
+            "-L", "-o", "/dev/null", "-sS",
+            "-w", "HTTP: %{http_code}\n速度: %{speed_download} bytes/s\n耗时: %{time_total}s\n",
+            "https://github.com"
+        ])
+    except FileNotFoundError:
+        print("✗ 找不到 curl")
+
+def show_log():
+    if not LOGFILE.exists():
+        print("暂无日志")
+        return
+    lines = LOGFILE.read_text(encoding="utf-8", errors="replace").splitlines()
+    print("\n".join(lines[-50:]))
+
+def git_on():
+    proxy = f"http://{HOST}:{PORT}"
+    try:
+        run(["git", "config", "--global", "http.proxy", proxy])
+        run(["git", "config", "--global", "https.proxy", proxy])
+        print(f"✓ Git 代理已开启：{proxy}")
+    except FileNotFoundError:
+        print("✗ 找不到 git")
+
+def git_off():
+    try:
+        run(["git", "config", "--global", "--unset-all", "http.proxy"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        run(["git", "config", "--global", "--unset-all", "https.proxy"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("✓ Git 代理已关闭")
+    except FileNotFoundError:
+        print("✗ 找不到 git")
+
+def parse_vless(uri, index):
+    u = urllib.parse.urlsplit(uri.strip())
+    if u.scheme.lower() != "vless":
+        raise ValueError("不是 VLESS")
+    uuid = urllib.parse.unquote(u.username or "")
+    host, port = u.hostname, u.port
+    if not uuid or not host or not port:
+        raise ValueError("地址不完整")
+    q = urllib.parse.parse_qs(u.query)
+
+    def one(name, default=""):
+        return urllib.parse.unquote(q.get(name, [default])[0])
+
+    name = urllib.parse.unquote(u.fragment or f"节点-{index:02d}")
+    tag = f"{index:02d}-{name}"
+    ob = {"type": "vless", "tag": tag, "server": host, "server_port": port, "uuid": uuid}
+
+    flow = one("flow")
+    if flow:
+        ob["flow"] = flow
+
+    security = one("security").lower()
+    if security in ("tls", "reality"):
+        tls = {"enabled": True}
+        sni = one("sni") or one("serverName")
+        if sni: tls["server_name"] = sni
+        fp = one("fp")
+        if fp: tls["utls"] = {"enabled": True, "fingerprint": fp}
+        if security == "reality":
+            reality = {"enabled": True}
+            pbk = one("pbk") or one("publicKey")
+            sid = one("sid") or one("shortId")
+            if pbk: reality["public_key"] = pbk
+            if sid: reality["short_id"] = sid
+            tls["reality"] = reality
+        ob["tls"] = tls
+
+    network = one("type").lower()
+    if network == "ws":
+        tr = {"type": "ws"}
+        path, h = one("path"), one("host")
+        if path: tr["path"] = path
+        if h: tr["headers"] = {"Host": h}
+        ob["transport"] = tr
+    elif network == "grpc":
+        tr = {"type": "grpc"}
+        service = one("serviceName") or one("service_name")
+        if service: tr["service_name"] = service
+        ob["transport"] = tr
+    elif network in ("http", "h2"):
+        tr = {"type": "http"}
+        h, path = one("host"), one("path")
+        if h: tr["host"] = [h]
+        if path: tr["path"] = path
+        ob["transport"] = tr
+    return ob
+
+def download_subscription(url):
+    print("正在下载订阅...")
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=180) as r:
+        data = r.read()
+    print(f"✓ 下载完成：{len(data)} bytes")
+    return data
+
+def decode_subscription(data):
+    text = data.decode("utf-8", errors="ignore").strip()
+    if "vless://" in text:
+        return text
+    compact = "".join(text.split())
+    compact += "=" * ((4 - len(compact) % 4) % 4)
+    try:
+        decoded = base64.b64decode(compact).decode("utf-8", errors="ignore")
+        if "vless://" in decoded:
+            return decoded
+    except Exception:
+        pass
+    raise RuntimeError("订阅中没有找到可识别的 VLESS 节点")
+
+def build_nodes(text):
+    links = [x.strip() for x in text.splitlines() if x.strip().startswith("vless://")]
+    if not links:
+        raise RuntimeError("没有找到 VLESS 节点")
+    nodes = []
+    for i, link in enumerate(links, 1):
+        try:
+            nodes.append(parse_vless(link, i))
+        except Exception as e:
+            print(f"跳过节点 {i}: {e}")
+    if not nodes:
+        raise RuntimeError("所有节点解析失败")
+    print(f"✓ 成功解析 {len(nodes)} 个 VLESS 节点")
+    return nodes
+
+def make_config(nodes):
+    tags = [x["tag"] for x in nodes]
+    return {
+        "log": {"level": "info", "timestamp": True},
+        "inbounds": [{"type": "mixed", "tag": "mixed-in", "listen": HOST, "listen_port": PORT}],
+        "outbounds": [
+            {"type": "selector", "tag": "proxy", "outbounds": tags, "default": tags[0]},
+            *nodes,
+            {"type": "direct", "tag": "direct"}
+        ],
+        "route": {"final": "proxy"}
+    }
+
+def save_config(cfg, path):
+    Path(path).write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def speed_test_node(node, index, total):
+    cfg = {
+        "log": {"level": "error"},
+        "inbounds": [{"type": "mixed", "tag": "test-in", "listen": HOST, "listen_port": TEST_PORT}],
+        "outbounds": [node, {"type": "direct", "tag": "direct"}],
+        "route": {"final": node["tag"]}
+    }
+    fd, name = tempfile.mkstemp(prefix="sb-test-", suffix=".json")
+    os.close(fd)
+    path = Path(name)
+    save_config(cfg, path)
+    proc = None
+    speed = 0.0
+    try:
+        proc = subprocess.Popen([str(ensure_binary()), "run", "-c", str(path)],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.8)
+        r = run([
+            "curl", "--proxy", f"http://{HOST}:{TEST_PORT}",
+            "--connect-timeout", "5", "--max-time", "15",
+            "-L", "-o", "/dev/null", "-s", "-w", "%{speed_download}",
+            f"https://speed.cloudflare.com/__down?bytes={TEST_BYTES}"
+        ], capture=True)
+        try: speed = float(r.stdout.strip())
+        except Exception: speed = 0.0
+    except Exception:
+        speed = 0.0
+    finally:
+        if proc:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try: proc.kill()
+                except Exception: pass
+        try: path.unlink()
+        except Exception: pass
+
+    print(f"[{index:02d}/{total:02d}] {speed/1024/1024:6.2f} MB/s "
+          f"({speed*8/1_000_000:6.2f} Mbps)  {node['tag']}")
+    return speed
+
+def speedtest_nodes(nodes):
+    print(f"\n开始节点测速（每节点约 {TEST_BYTES/1_000_000:.0f} MB）...\n")
+    results = [(speed_test_node(n, i, len(nodes)), n)
+               for i, n in enumerate(nodes, 1)]
+    results.sort(key=lambda x: x[0], reverse=True)
+    print("\n========== 测速排名 ==========")
+    for i, (speed, node) in enumerate(results[:10], 1):
+        print(f"{i:2d}. {speed/1024/1024:6.2f} MB/s "
+              f"({speed*8/1_000_000:6.2f} Mbps) {node['tag']}")
+    print("==============================")
+    return [n for _, n in results]
+
+def setup():
+    require_root()
+    ensure_binary()
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    url = getpass.getpass("请输入订阅链接（输入不会显示）: ").strip()
+    if not url:
+        print("✗ 未输入订阅链接")
+        return
+    try:
+        nodes = build_nodes(decode_subscription(download_subscription(url)))
+        nodes = speedtest_nodes(nodes)
+        cfg = make_config(nodes)
+        tmp = CONFIG_DIR / "config.json.new"
+        save_config(cfg, tmp)
+        print("\n检查新配置...")
+        if not check_config(tmp):
+            print("✗ 新配置检查失败；原配置未修改")
+            try: tmp.unlink()
+            except FileNotFoundError: pass
+            return
+        if CONFIG.exists():
+            shutil.copy2(CONFIG, BACKUP)
+            print(f"✓ 旧配置备份：{BACKUP}")
+        os.replace(tmp, CONFIG)
+        print(f"✓ 配置已保存：{CONFIG}")
+        print(f"✓ 默认最快节点：{nodes[0]['tag']}")
+        git_on()
+        stop(quiet=True)
+        start()
+    except Exception as e:
+        print(f"✗ 配置失败：{e}")
+        print("原有配置不会因本次失败而被覆盖。")
+
+def speedtest_existing():
+    require_root()
+    ensure_binary()
+    if not CONFIG.exists():
+        print("✗ 没有配置，请先运行 sb setup")
+        return
+    cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
+    nodes = [x for x in cfg.get("outbounds", []) if x.get("type") == "vless"]
+    if not nodes:
+        print("✗ config.json 中没有 VLESS 节点")
+        return
+    nodes = speedtest_nodes(nodes)
+    tmp = CONFIG_DIR / "config.json.new"
+    save_config(make_config(nodes), tmp)
+    if not check_config(tmp):
+        print("✗ 新配置检查失败；原配置未修改")
+        try: tmp.unlink()
+        except FileNotFoundError: pass
+        return
+    shutil.copy2(CONFIG, BACKUP)
+    os.replace(tmp, CONFIG)
+    print(f"✓ 已切换最快节点：{nodes[0]['tag']}")
+    if find_pid():
+        restart()
+
+def version():
+    print(f"sb {SB_VERSION}")
+    p = binary_path()
+    if p.exists():
+        run([str(p), "version"])
+    else:
+        print("sing-box: 未找到")
+
+def help_text():
+    print(f"""sb {SB_VERSION} - AutoDL sing-box 管理工具
+
+AutoDL 首次安装（仓库只需要 sb）：
+  chmod +x sb
+  ./sb install
+  sb setup
+
+说明：
+  install 会优先使用 /etc/network_turbo 临时加速，
+  自动识别 amd64/arm64，并从 SagerNet 官方 GitHub
+  Release 下载最新稳定版 sing-box。
+
+安装管理：
+  sb install      安装 sb，并自动获取官方 sing-box
+  sb uninstall    卸载程序（配置会另行询问）
+  sb version      查看版本
+
+订阅/节点：
+  sb setup        输入订阅、解析、全节点测速、生成配置并启动
+  sb update       重新输入订阅并完整更新
+  sb speedtest    对现有配置全部 VLESS 节点重新测速并切换最快
+
+运行管理：
+  sb start        启动
+  sb stop         停止
+  sb restart      重启
+  sb status       状态 + GitHub 代理检查
+  sb test         当前节点 GitHub 测速
+  sb log          最近 50 行日志
+
+Git：
+  sb git-on       开启 Git 全局代理
+  sb git-off      关闭 Git 全局代理
+
+路径：
+  程序    /usr/local/bin/sb
+  sing-box /usr/local/bin/sing-box
+  配置    /etc/sing-box/config.json
+  备份    /etc/sing-box/config.json.bak
+  日志    /var/log/sing-box.log
+  PID     /run/sing-box.pid
+
+代理：
+  http://127.0.0.1:1080
+""")
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "help"
+    commands = {
+        "install": install, "uninstall": uninstall, "version": version,
+        "setup": setup, "update": setup, "speedtest": speedtest_existing,
+        "start": start, "stop": stop, "restart": restart,
+        "status": status, "test": test, "log": show_log,
+        "git-on": git_on, "git-off": git_off, "help": help_text,
+    }
+    fn = commands.get(cmd)
+    if not fn:
+        print(f"未知命令：{cmd}\n")
+        help_text()
+        sys.exit(1)
+    fn()
+
+if __name__ == "__main__":
+    main()
