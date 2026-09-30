@@ -1,0 +1,20 @@
+# sing-box 配置（包含节点凭证）
+config.json
+config.json.bak
+config.json.new
+
+# 订阅文件
+sub.txt
+sub-decoded.txt
+
+# 日志和 PID
+*.log
+*.pid
+
+# Python
+__pycache__/
+*.pyc
+
+# 临时文件
+*.tmp
+.DS_Store
