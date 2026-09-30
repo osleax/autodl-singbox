@@ -19,11 +19,11 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-SB_VERSION = "1.1.0-autodl"
+SB_VERSION = "1.2.0-autodl"
 HOST = "127.0.0.1"
 PORT = 1080
 TEST_PORT = 19080
-TEST_BYTES = 5_000_000
+TEST_BYTES = 500_000
 
 SYSTEM_SB = Path("/usr/local/bin/sb")
 SYSTEM_BIN = Path("/usr/local/bin/sing-box")
@@ -268,8 +268,8 @@ def proxy_test(timeout=15, retries=3):
             r = run([
                 "curl", "--proxy", f"http://{HOST}:{PORT}",
                 "--connect-timeout", "10", "--max-time", str(timeout),
-                "-L", "-o", "/dev/null", "-s", "-w", "%{http_code}",
-                "https://github.com"
+                "-I", "-L", "-o", "/dev/null", "-s", "-w", "%{http_code}",
+                "https://github.com/favicon.ico"
             ], capture=True)
 
             if r.returncode == 0 and r.stdout.strip() in ("200", "301", "302"):
@@ -496,18 +496,55 @@ def decode_subscription(data):
     raise RuntimeError("订阅中没有找到可识别的 VLESS 节点")
 
 def build_nodes(text):
-    links = [x.strip() for x in text.splitlines() if x.strip().startswith("vless://")]
+    links = [
+        x.strip()
+        for x in text.splitlines()
+        if x.strip().startswith("vless://")
+    ]
+
     if not links:
         raise RuntimeError("没有找到 VLESS 节点")
+
+    # 一些订阅会把流量、重置时间、到期时间等信息
+    # 伪装成 VLESS 链接。根据节点名称过滤这些非代理条目。
+    info_keywords = (
+        "剩余流量",
+        "流量剩余",
+        "距离下次重置",
+        "下次重置",
+        "套餐到期",
+        "到期时间",
+        "过期时间",
+        "有效期",
+    )
+
     nodes = []
+    skipped_info = 0
+
     for i, link in enumerate(links, 1):
         try:
-            nodes.append(parse_vless(link, i))
+            node = parse_vless(link, i)
+
+            tag = node.get("tag", "")
+
+            if any(keyword in tag for keyword in info_keywords):
+                skipped_info += 1
+                print(f"跳过订阅信息：{tag}")
+                continue
+
+            nodes.append(node)
+
         except Exception as e:
             print(f"跳过节点 {i}: {e}")
+
     if not nodes:
         raise RuntimeError("所有节点解析失败")
+
     print(f"✓ 成功解析 {len(nodes)} 个 VLESS 节点")
+
+    if skipped_info:
+        print(f"✓ 已过滤 {skipped_info} 个订阅信息条目")
+
     return nodes
 
 def make_config(nodes):
@@ -526,59 +563,392 @@ def make_config(nodes):
 def save_config(cfg, path):
     Path(path).write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def speed_test_node(node, index, total):
+def probe_node(node, checks=1, timeout=5):
+    """
+    启动临时代理并进行 GitHub HEAD 检查。
+
+    返回：
+      (成功次数, 总次数, 成功请求平均耗时)
+
+    如果全部失败，平均耗时为 None。
+    """
     cfg = {
         "log": {"level": "error"},
-        "inbounds": [{"type": "mixed", "tag": "test-in", "listen": HOST, "listen_port": TEST_PORT}],
+        "inbounds": [{
+            "type": "mixed",
+            "tag": "test-in",
+            "listen": HOST,
+            "listen_port": TEST_PORT
+        }],
         "outbounds": [node, {"type": "direct", "tag": "direct"}],
         "route": {"final": node["tag"]}
     }
+
     fd, name = tempfile.mkstemp(prefix="sb-test-", suffix=".json")
     os.close(fd)
     path = Path(name)
     save_config(cfg, path)
+
     proc = None
-    speed = 0.0
+    times = []
+
     try:
-        proc = subprocess.Popen([str(ensure_binary()), "run", "-c", str(path)],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(0.8)
-        r = run([
-            "curl", "--proxy", f"http://{HOST}:{TEST_PORT}",
-            "--connect-timeout", "5", "--max-time", "15",
-            "-L", "-o", "/dev/null", "-s", "-w", "%{speed_download}",
-            f"https://speed.cloudflare.com/__down?bytes={TEST_BYTES}"
-        ], capture=True)
-        try: speed = float(r.stdout.strip())
-        except Exception: speed = 0.0
+        proc = subprocess.Popen(
+            [str(ensure_binary()), "run", "-c", str(path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        time.sleep(0.5)
+
+        for i in range(checks):
+            r = run([
+                "curl",
+                "--proxy", f"http://{HOST}:{TEST_PORT}",
+                "--connect-timeout", str(timeout),
+                "--max-time", str(timeout),
+                "-I", "-L",
+                "-o", "/dev/null",
+                "-s",
+                "-w", "%{http_code} %{time_total}",
+                "https://github.com/favicon.ico"
+            ], capture=True)
+
+            if r.returncode == 0:
+                try:
+                    parts = r.stdout.strip().split()
+
+                    if (
+                        len(parts) == 2
+                        and parts[0] in ("200", "301", "302")
+                    ):
+                        times.append(float(parts[1]))
+                except Exception:
+                    pass
+
+            if checks > 1 and i < checks - 1:
+                time.sleep(0.2)
+
+        avg = sum(times) / len(times) if times else None
+        return len(times), checks, avg
+
     except Exception:
-        speed = 0.0
+        return 0, checks, None
+
     finally:
         if proc:
             try:
                 proc.terminate()
                 proc.wait(timeout=2)
             except Exception:
-                try: proc.kill()
-                except Exception: pass
-        try: path.unlink()
-        except Exception: pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
-    print(f"[{index:02d}/{total:02d}] {speed/1024/1024:6.2f} MB/s "
-          f"({speed*8/1_000_000:6.2f} Mbps)  {node['tag']}")
+        try:
+            path.unlink()
+        except Exception:
+            pass
+
+def download_test_node(node):
+    """候选节点 500 KB 下载测速。"""
+    cfg = {
+        "log": {"level": "error"},
+        "inbounds": [{
+            "type": "mixed",
+            "tag": "test-in",
+            "listen": HOST,
+            "listen_port": TEST_PORT
+        }],
+        "outbounds": [node, {"type": "direct", "tag": "direct"}],
+        "route": {"final": node["tag"]}
+    }
+
+    fd, name = tempfile.mkstemp(prefix="sb-test-", suffix=".json")
+    os.close(fd)
+    path = Path(name)
+    save_config(cfg, path)
+
+    proc = None
+    speed = 0.0
+
+    try:
+        proc = subprocess.Popen(
+            [str(ensure_binary()), "run", "-c", str(path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        time.sleep(0.5)
+
+        r = run([
+            "curl",
+            "--proxy", f"http://{HOST}:{TEST_PORT}",
+            "--connect-timeout", "5",
+            "--max-time", "10",
+            "-L",
+            "-o", "/dev/null",
+            "-s",
+            "-w", "%{speed_download}",
+            f"https://speed.cloudflare.com/__down?bytes={TEST_BYTES}"
+        ], capture=True)
+
+        if r.returncode == 0:
+            try:
+                speed = float(r.stdout.strip())
+            except Exception:
+                pass
+
+    except Exception:
+        pass
+
+    finally:
+        if proc:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+        try:
+            path.unlink()
+        except Exception:
+            pass
+
     return speed
 
+
 def speedtest_nodes(nodes):
-    print(f"\n开始节点测速（每节点约 {TEST_BYTES/1_000_000:.0f} MB）...\n")
-    results = [(speed_test_node(n, i, len(nodes)), n)
-               for i, n in enumerate(nodes, 1)]
-    results.sort(key=lambda x: x[0], reverse=True)
-    print("\n========== 测速排名 ==========")
-    for i, (speed, node) in enumerate(results[:10], 1):
-        print(f"{i:2d}. {speed/1024/1024:6.2f} MB/s "
-              f"({speed*8/1_000_000:6.2f} Mbps) {node['tag']}")
-    print("==============================")
-    return [n for _, n in results]
+    # 亚洲关键词：优先测试这些节点。
+    asia_keywords = (
+        "日本", "JP", "Japan",
+        "香港", "HK", "Hong Kong",
+        "新加坡", "SG", "Singapore",
+        "台湾", "TW", "Taiwan",
+        "韩国", "KR", "Korea",
+        "马来西亚", "MY", "Malaysia",
+        "泰国", "TH", "Thailand",
+        "菲律宾", "PH", "Philippines",
+        "印度", "IN", "India",
+        "越南", "VN", "Vietnam",
+        "印尼", "印度尼西亚", "ID", "Indonesia",
+    )
+
+    def is_asia(node):
+        tag = node.get("tag", "")
+        tag_lower = tag.lower()
+
+        for keyword in asia_keywords:
+            if keyword.isascii():
+                # 英文缩写/名称按单词或常见分隔符做宽松匹配。
+                k = keyword.lower()
+                parts = (
+                    tag_lower.replace("-", " ")
+                    .replace("_", " ")
+                    .replace("|", " ")
+                    .replace("🇯🇵", " ")
+                    .replace("🇭🇰", " ")
+                    .replace("🇸🇬", " ")
+                    .replace("🇹🇼", " ")
+                    .replace("🇰🇷", " ")
+                ).split()
+                # 两字母地区代码必须是独立 token，避免 IN/ID/SG
+                # 误匹配普通英文单词；完整英文名称允许包含匹配。
+                if len(k) == 2:
+                    if k in parts:
+                        return True
+                elif k in tag_lower:
+                    return True
+            elif keyword in tag:
+                return True
+
+        return False
+
+    asia_nodes = [node for node in nodes if is_asia(node)]
+    other_nodes = [node for node in nodes if not is_asia(node)]
+
+    print(
+        f"\n节点分组：亚洲 {len(asia_nodes)} 个，"
+        f"其他地区 {len(other_nodes)} 个"
+    )
+
+    def verify_group(group, title):
+        if not group:
+            return []
+
+        print(
+            f"\n{title}：稳定性测试"
+            f"（每节点 5 次 GitHub HEAD）...\n"
+        )
+
+        results = []
+        total = len(group)
+
+        for i, node in enumerate(group, 1):
+            success, checks, latency = probe_node(
+                node,
+                checks=5,
+                timeout=6
+            )
+
+            rate = success / checks
+
+            if success == 0 or latency is None:
+                print(
+                    f"[{i:02d}/{total:02d}] "
+                    f"0/{checks}   FAIL       {node['tag']}"
+                )
+                continue
+
+            print(
+                f"[{i:02d}/{total:02d}] "
+                f"{success}/{checks} "
+                f"({rate*100:3.0f}%)  "
+                f"{latency*1000:6.0f} ms   "
+                f"{node['tag']}"
+            )
+
+            results.append((rate, latency, node))
+
+        # 至少 4/5（80%）才允许自动选择。
+        qualified = [
+            item for item in results
+            if item[0] >= 0.8
+        ]
+
+        qualified.sort(key=lambda x: (-x[0], x[1]))
+        return qualified
+
+    # 第一优先级：亚洲。
+    qualified = verify_group(asia_nodes, "第一阶段：亚洲节点")
+
+    if qualified:
+        print(
+            f"\n✓ 亚洲有 {len(qualified)} 个节点"
+            "达到至少 80% 成功率，不测试其他地区"
+        )
+    else:
+        print(
+            "\n! 亚洲没有节点达到 80% 成功率，"
+            "开始测试其他地区"
+        )
+        qualified = verify_group(
+            other_nodes,
+            "第二阶段：其他地区节点"
+        )
+
+    if not qualified:
+        raise RuntimeError(
+            "没有节点达到 80% 稳定性要求，保留原配置"
+        )
+
+    # 最高成功率优先。
+    best_rate = qualified[0][0]
+
+    stable = [
+        (rate, latency, node)
+        for rate, latency, node in qualified
+        if rate == best_rate
+    ]
+
+    # 同成功率下优先低延迟。
+    stable.sort(key=lambda x: x[1])
+
+    # 延迟 <= 1000 ms 的节点优先。
+    low_latency = [
+        item for item in stable
+        if item[1] <= 1.0
+    ]
+
+    if low_latency:
+        stable = low_latency
+
+    # 只取稳定性最高、延迟最低的 3 个做下载测速。
+    stable = stable[:3]
+
+    print(
+        f"\n第三阶段：下载测速 {len(stable)} 个候选"
+        f"（每节点约 {TEST_BYTES/1_000_000:.1f} MB）...\n"
+    )
+
+    speed_results = []
+
+    for i, (rate, latency, node) in enumerate(stable, 1):
+        speed = download_test_node(node)
+
+        if speed > 0:
+            print(
+                f"[{i:02d}/{len(stable):02d}] "
+                f"{rate*100:3.0f}%  "
+                f"{latency*1000:5.0f} ms  "
+                f"{speed/1024/1024:6.2f} MB/s "
+                f"({speed*8/1_000_000:6.2f} Mbps)  "
+                f"{node['tag']}"
+            )
+            speed_results.append(
+                (rate, latency, speed, node)
+            )
+        else:
+            print(
+                f"[{i:02d}/{len(stable):02d}] "
+                f"{rate*100:3.0f}%  "
+                f"{latency*1000:5.0f} ms  "
+                f"FAIL  {node['tag']}"
+            )
+
+    if not speed_results:
+        raise RuntimeError(
+            "稳定候选下载测速全部失败，保留原配置"
+        )
+
+    # 稳定性第一，延迟第二，下载速度第三。
+    speed_results.sort(
+        key=lambda x: (-x[0], x[1], -x[2])
+    )
+
+    ranked_tags = {
+        node["tag"]
+        for _, _, _, node in speed_results
+    }
+
+    remaining = [
+        node for node in nodes
+        if node["tag"] not in ranked_tags
+    ]
+
+    ordered = [
+        node
+        for _, _, _, node in speed_results
+    ] + remaining
+
+    print("\n========== 最终排名 ==========")
+
+    for i, (rate, latency, speed, node) in enumerate(
+        speed_results, 1
+    ):
+        print(
+            f"{i:2d}. "
+            f"{rate*100:3.0f}%  "
+            f"{latency*1000:5.0f} ms  "
+            f"{speed/1024/1024:6.2f} MB/s "
+            f"({speed*8/1_000_000:6.2f} Mbps)  "
+            f"{node['tag']}"
+        )
+
+    best_rate, best_latency, best_speed, best_node = (
+        speed_results[0]
+    )
+
+    print(
+        f"\n✓ 推荐节点：{best_node['tag']}\n"
+        f"  成功率：{best_rate*100:.0f}%\n"
+        f"  平均延迟：{best_latency*1000:.0f} ms\n"
+        f"  下载速度：{best_speed/1024/1024:.2f} MB/s"
+    )
+
+    return ordered
 
 def setup():
     require_root()
@@ -620,11 +990,40 @@ def speedtest_existing():
         print("✗ 没有配置，请先运行 sb setup")
         return
     cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
-    nodes = [x for x in cfg.get("outbounds", []) if x.get("type") == "vless"]
+    info_keywords = (
+        "剩余流量",
+        "流量剩余",
+        "距离下次重置",
+        "下次重置",
+        "套餐到期",
+        "到期时间",
+        "过期时间",
+        "有效期",
+    )
+
+    all_nodes = [
+        x for x in cfg.get("outbounds", [])
+        if x.get("type") == "vless"
+    ]
+
+    nodes = [
+        x for x in all_nodes
+        if not any(keyword in x.get("tag", "") for keyword in info_keywords)
+    ]
+
+    filtered = len(all_nodes) - len(nodes)
+    if filtered:
+        print(f"✓ 已忽略 {filtered} 个订阅信息条目")
     if not nodes:
         print("✗ config.json 中没有 VLESS 节点")
         return
-    nodes = speedtest_nodes(nodes)
+    try:
+        nodes = speedtest_nodes(nodes)
+    except Exception as e:
+        print(f"✗ 测速失败：{e}")
+        print("✓ 当前配置保持不变")
+        return
+
     tmp = CONFIG_DIR / "config.json.new"
     save_config(make_config(nodes), tmp)
     if not check_config(tmp):
@@ -649,8 +1048,7 @@ def version():
 def help_text():
     print(f"""sb {SB_VERSION} - AutoDL sing-box 管理工具
 
-AutoDL 首次安装（仓库只需要 sb）：
-  chmod +x sb
+AutoDL 首次安装：
   ./sb install
   sb setup
 
@@ -665,9 +1063,9 @@ AutoDL 首次安装（仓库只需要 sb）：
   sb version      查看版本
 
 订阅/节点：
-  sb setup        输入订阅、解析、全节点测速、生成配置并启动
+  sb setup        输入订阅、智能测速、生成配置并启动
   sb update       重新输入订阅并完整更新
-  sb speedtest    对现有配置全部 VLESS 节点重新测速并切换最快
+  sb speedtest    低流量筛选稳定节点并自动切换
 
 运行管理：
   sb start        启动
