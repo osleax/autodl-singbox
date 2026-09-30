@@ -2,6 +2,60 @@
 
 面向 AutoDL 容器环境的 sing-box 自动配置与代理管理工具。
 
+## 快速使用
+
+### 新 AutoDL 实例
+
+```bash
+source /etc/network_turbo
+git clone https://github.com/osleax/autodl-singbox.git
+cd autodl-singbox
+./sb install
+
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+
+sb setup
+sb status
+```
+
+`sb setup` 会自动解析 VLESS 订阅、过滤订阅信息条目并筛选节点。
+
+当前节点选择策略以 **GitHub 稳定性优先**：
+
+1. 优先测试亚洲节点
+2. 每个节点进行 5 次低流量 GitHub 连通性检查
+3. 成功率至少 80% 才进入候选
+4. 优先选择成功率更高、平均延迟更低的节点
+5. 最多选择 3 个稳定候选进行下载测速
+6. 每个下载测速候选约使用 500 KB 流量
+7. 亚洲没有合格节点时再测试其他地区
+
+### 日常使用
+
+```bash
+sb status       # 查看状态
+sb test         # 测试当前 GitHub 代理
+sb speedtest    # 重新筛选稳定节点
+sb update       # 更新订阅
+sb restart      # 重启 sing-box
+sb log          # 查看日志
+sb git-on       # 开启 Git 全局代理
+sb git-off      # 关闭 Git 全局代理
+sb version      # 查看版本
+```
+
+当前节点不稳定、GitHub 经常超时或速度明显下降时，运行：
+
+```bash
+sb speedtest
+```
+
+需要排查问题时：
+
+```bash
+sb log
+```
+
 ## 功能
 
 - 自动检测 AutoDL 环境
@@ -9,8 +63,10 @@
 - 自动识别 `amd64` / `arm64`
 - 自动获取 sing-box 官方稳定版
 - 支持 VLESS 订阅解析
-- 自动测试全部节点速度
-- 自动选择测速最快节点
+- 稳定性优先的低流量节点筛选
+- 亚洲节点优先，亚洲无合格节点时自动测试其他地区
+- 每节点多次 GitHub 连通性检查，降低网络抖动影响
+- 自动过滤剩余流量、套餐到期、重置时间等订阅信息条目
 - GitHub 代理连通性检查
 - 健康检查失败自动重试，减少网络抖动造成的误报
 - sing-box 启动、停止、重启、状态和日志管理
@@ -88,7 +144,7 @@ sb setup
 - 下载订阅
 - 解析 VLESS 节点
 - 测试节点
-- 选择最快节点
+- 筛选稳定节点
 - 生成 sing-box 配置
 - 启动代理
 - 测试 GitHub 连通性
@@ -136,7 +192,7 @@ sb help          # 查看帮助
 sb setup         # 首次配置 / 重新配置订阅
 sb status        # 查看运行状态和代理连通性
 sb test          # 测试当前节点访问 GitHub
-sb speedtest     # 重新测试全部现有节点并选择最快节点
+sb speedtest     # 稳定性优先重新筛选现有节点
 sb update        # 更新订阅
 sb start         # 启动 sing-box
 sb stop          # 停止 sing-box
@@ -193,9 +249,9 @@ git -c http.proxy=http://127.0.0.1:1080 \
 sb speedtest
 ```
 
-程序会重新测试配置中的 VLESS 节点，并选择本次测速最快的节点。
+程序会重新测试配置中的 VLESS 节点，以 GitHub 稳定性和延迟为主要依据筛选节点。
 
-网络质量存在波动，因此不同时间测速得到的最快节点可能不同。
+网络质量存在波动，因此不同时间筛选出的推荐节点可能不同。
 
 ## 更新订阅
 
