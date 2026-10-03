@@ -3,6 +3,7 @@
 # Requires: Python 3, curl, git (for git-on/off), and sing-box binary.
 
 import base64
+import concurrent.futures
 import platform
 import re
 import tarfile
@@ -19,17 +20,19 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-SB_VERSION = "1.2.0-autodl"
+SB_VERSION = "1.3.0-autodl"
 HOST = "127.0.0.1"
 PORT = 1080
 TEST_PORT = 19080
 TEST_BYTES = 500_000
+HEAD_WORKERS = 5
 
 SYSTEM_SB = Path("/usr/local/bin/sb")
 SYSTEM_BIN = Path("/usr/local/bin/sing-box")
 CONFIG_DIR = Path("/etc/sing-box")
 CONFIG = CONFIG_DIR / "config.json"
 BACKUP = CONFIG_DIR / "config.json.bak"
+SPEEDTEST_CACHE = CONFIG_DIR / "speedtest.json"
 LOGFILE = Path("/var/log/sing-box.log")
 PIDFILE = Path("/run/sing-box.pid")
 
@@ -46,6 +49,36 @@ def require_root():
     if not is_root():
         print("✗ 此命令需要 root 权限。")
         sys.exit(1)
+
+def load_speedtest_cache():
+    """读取最近一次节点测试数据。"""
+    if not SPEEDTEST_CACHE.is_file():
+        return {}
+
+    try:
+        data = json.loads(SPEEDTEST_CACHE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    return {}
+
+
+def save_speedtest_cache(data):
+    """保存节点测试数据。"""
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+        tmp = SPEEDTEST_CACHE.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp.replace(SPEEDTEST_CACHE)
+    except OSError as e:
+        print(f"⚠ 保存测速记录失败：{e}")
+
 
 def current_script():
     return Path(__file__).resolve()
@@ -111,8 +144,12 @@ def latest_stable_version(env):
     })
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({
-            "http": env.get("http_proxy") or env.get("HTTP_PROXY"),
-            "https": env.get("https_proxy") or env.get("HTTPS_PROXY"),
+            scheme: value
+            for scheme, value in {
+                "http": env.get("http_proxy") or env.get("HTTP_PROXY"),
+                "https": env.get("https_proxy") or env.get("HTTPS_PROXY"),
+            }.items()
+            if value
         })
     )
     with opener.open(req, timeout=60) as r:
@@ -473,6 +510,59 @@ def parse_vless(uri, index):
         ob["transport"] = tr
     return ob
 
+
+def parse_hysteria2(uri, index):
+    u = urllib.parse.urlsplit(uri.strip())
+
+    if u.scheme.lower() not in ("hysteria2", "hy2"):
+        raise ValueError("不是 Hysteria2")
+
+    password = urllib.parse.unquote(u.username or "")
+    host = u.hostname
+    port = u.port
+
+    if not password or not host or not port:
+        raise ValueError("地址不完整")
+
+    q = urllib.parse.parse_qs(u.query)
+
+    def one(name, default=""):
+        return urllib.parse.unquote(q.get(name, [default])[0])
+
+    name = urllib.parse.unquote(u.fragment or f"节点-{index:02d}")
+    tag = f"{index:02d}-{name}"
+
+    ob = {
+        "type": "hysteria2",
+        "tag": tag,
+        "server": host,
+        "server_port": port,
+        "password": password,
+    }
+
+    tls = {"enabled": True}
+
+    sni = one("sni") or one("serverName")
+    if sni:
+        tls["server_name"] = sni
+
+    insecure = one("insecure").lower()
+    if insecure in ("1", "true", "yes"):
+        tls["insecure"] = True
+
+    ob["tls"] = tls
+
+    obfs = one("obfs")
+    obfs_password = one("obfs-password") or one("obfs_password")
+
+    if obfs:
+        ob["obfs"] = {
+            "type": obfs,
+            "password": obfs_password,
+        }
+
+    return ob
+
 def download_subscription(url):
     print("正在下载订阅...")
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -483,27 +573,35 @@ def download_subscription(url):
 
 def decode_subscription(data):
     text = data.decode("utf-8", errors="ignore").strip()
-    if "vless://" in text:
+
+    protocols = ("vless://", "hysteria2://", "hy2://")
+
+    if any(protocol in text for protocol in protocols):
         return text
+
     compact = "".join(text.split())
     compact += "=" * ((4 - len(compact) % 4) % 4)
+
     try:
         decoded = base64.b64decode(compact).decode("utf-8", errors="ignore")
-        if "vless://" in decoded:
+        if any(protocol in decoded for protocol in protocols):
             return decoded
     except Exception:
         pass
-    raise RuntimeError("订阅中没有找到可识别的 VLESS 节点")
+
+    raise RuntimeError("订阅中没有找到可识别的 VLESS/Hysteria2 节点")
 
 def build_nodes(text):
     links = [
         x.strip()
         for x in text.splitlines()
-        if x.strip().startswith("vless://")
+        if x.strip().lower().startswith(
+            ("vless://", "hysteria2://", "hy2://")
+        )
     ]
 
     if not links:
-        raise RuntimeError("没有找到 VLESS 节点")
+        raise RuntimeError("没有找到 VLESS/Hysteria2 节点")
 
     # 一些订阅会把流量、重置时间、到期时间等信息
     # 伪装成 VLESS 链接。根据节点名称过滤这些非代理条目。
@@ -523,7 +621,12 @@ def build_nodes(text):
 
     for i, link in enumerate(links, 1):
         try:
-            node = parse_vless(link, i)
+            if link.lower().startswith("vless://"):
+                node = parse_vless(link, i)
+            elif link.lower().startswith(("hysteria2://", "hy2://")):
+                node = parse_hysteria2(link, i)
+            else:
+                continue
 
             tag = node.get("tag", "")
 
@@ -540,7 +643,12 @@ def build_nodes(text):
     if not nodes:
         raise RuntimeError("所有节点解析失败")
 
-    print(f"✓ 成功解析 {len(nodes)} 个 VLESS 节点")
+    vless_count = sum(node.get("type") == "vless" for node in nodes)
+    hy2_count = sum(node.get("type") == "hysteria2" for node in nodes)
+    print(
+        f"✓ 成功解析 {len(nodes)} 个节点："
+        f"VLESS {vless_count}，Hysteria2 {hy2_count}"
+    )
 
     if skipped_info:
         print(f"✓ 已过滤 {skipped_info} 个订阅信息条目")
@@ -563,7 +671,7 @@ def make_config(nodes):
 def save_config(cfg, path):
     Path(path).write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def probe_node(node, checks=1, timeout=5):
+def probe_node(node, checks=1, timeout=5, test_port=TEST_PORT):
     """
     启动临时代理并进行 GitHub HEAD 检查。
 
@@ -578,7 +686,7 @@ def probe_node(node, checks=1, timeout=5):
             "type": "mixed",
             "tag": "test-in",
             "listen": HOST,
-            "listen_port": TEST_PORT
+            "listen_port": test_port
         }],
         "outbounds": [node, {"type": "direct", "tag": "direct"}],
         "route": {"final": node["tag"]}
@@ -603,7 +711,7 @@ def probe_node(node, checks=1, timeout=5):
         for i in range(checks):
             r = run([
                 "curl",
-                "--proxy", f"http://{HOST}:{TEST_PORT}",
+                "--proxy", f"http://{HOST}:{test_port}",
                 "--connect-timeout", str(timeout),
                 "--max-time", str(timeout),
                 "-I", "-L",
@@ -649,6 +757,56 @@ def probe_node(node, checks=1, timeout=5):
             path.unlink()
         except Exception:
             pass
+
+
+def probe_nodes_parallel(nodes, checks=5, timeout=6):
+    """并发测试多个节点；每个 worker 独占一个测试端口。"""
+    nodes = list(nodes)
+    if not nodes:
+        return []
+
+    worker_count = min(HEAD_WORKERS, len(nodes))
+
+    # 每个 worker 固定使用自己的端口。
+    queues = [[] for _ in range(worker_count)]
+    for index, node in enumerate(nodes):
+        queues[index % worker_count].append((index, node))
+
+    def worker(worker_id, jobs):
+        test_port = TEST_PORT + worker_id
+        results = []
+
+        for index, node in jobs:
+            success, total, latency = probe_node(
+                node,
+                checks=checks,
+                timeout=timeout,
+                test_port=test_port,
+            )
+            results.append(
+                (index, node, success, total, latency)
+            )
+
+        return results
+
+    all_results = []
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=worker_count
+    ) as executor:
+        futures = [
+            executor.submit(worker, worker_id, jobs)
+            for worker_id, jobs in enumerate(queues)
+            if jobs
+        ]
+
+        for future in concurrent.futures.as_completed(futures):
+            all_results.extend(future.result())
+
+    # 恢复原节点顺序，方便菜单和输出保持一致。
+    all_results.sort(key=lambda x: x[0])
+    return all_results
+
 
 def download_test_node(node):
     """候选节点 500 KB 下载测速。"""
@@ -720,59 +878,69 @@ def download_test_node(node):
     return speed
 
 
+def node_multiplier(tag):
+    """解析节点倍率；未明确标注倍率时按 1 倍处理。"""
+    tag = tag.casefold()
+
+    patterns = (
+        r"(?<![\d.])([0-9]+(?:\.[0-9]+)?)\s*(?:倍率|倍|[x×✕])(?![a-z0-9.])",
+        r"(?:倍率|[x×✕])\s*[:：=]?\s*([0-9]+(?:\.[0-9]+)?)(?![\d.])",
+    )
+
+    for pattern in patterns:
+        match = re.search(pattern, tag)
+        if match:
+            return float(match.group(1))
+
+    # 没有标倍率 = 1 倍
+    return 1.0
+
+
+def node_priority(node):
+    """倍率越低优先级越高。"""
+    multiplier = node_multiplier(node.get("tag", ""))
+
+    if multiplier == 0.01:
+        return 0
+    if multiplier == 0.1:
+        return 1
+    if multiplier == 1.0:
+        return 2
+
+    # 其他特殊倍率
+    return 3
+
+
+NODE_GROUP_TITLES = (
+    "0.01 倍率",
+    "0.1 倍率",
+    "1 倍率",
+    "其他倍率",
+)
+
 def speedtest_nodes(nodes):
-    # 亚洲关键词：优先测试这些节点。
-    asia_keywords = (
-        "日本", "JP", "Japan",
-        "香港", "HK", "Hong Kong",
-        "新加坡", "SG", "Singapore",
-        "台湾", "TW", "Taiwan",
-        "韩国", "KR", "Korea",
-        "马来西亚", "MY", "Malaysia",
-        "泰国", "TH", "Thailand",
-        "菲律宾", "PH", "Philippines",
-        "印度", "IN", "India",
-        "越南", "VN", "Vietnam",
-        "印尼", "印度尼西亚", "ID", "Indonesia",
+    speedtest_cache = load_speedtest_cache()
+
+    # 纯倍率优先：
+    # 0.01 倍 -> 0.1 倍 -> 1 倍 -> 其他特殊倍率
+    # 未标明倍率的节点由 node_multiplier() 按 1 倍处理。
+    titles = (
+        "0.01 倍率",
+        "0.1 倍率",
+        "1 倍率",
+        "其他倍率",
     )
 
-    def is_asia(node):
-        tag = node.get("tag", "")
-        tag_lower = tag.lower()
+    groups = [[] for _ in titles]
 
-        for keyword in asia_keywords:
-            if keyword.isascii():
-                # 英文缩写/名称按单词或常见分隔符做宽松匹配。
-                k = keyword.lower()
-                parts = (
-                    tag_lower.replace("-", " ")
-                    .replace("_", " ")
-                    .replace("|", " ")
-                    .replace("🇯🇵", " ")
-                    .replace("🇭🇰", " ")
-                    .replace("🇸🇬", " ")
-                    .replace("🇹🇼", " ")
-                    .replace("🇰🇷", " ")
-                ).split()
-                # 两字母地区代码必须是独立 token，避免 IN/ID/SG
-                # 误匹配普通英文单词；完整英文名称允许包含匹配。
-                if len(k) == 2:
-                    if k in parts:
-                        return True
-                elif k in tag_lower:
-                    return True
-            elif keyword in tag:
-                return True
+    for node in nodes:
+        priority = node_priority(node)
+        groups[priority].append(node)
 
-        return False
-
-    asia_nodes = [node for node in nodes if is_asia(node)]
-    other_nodes = [node for node in nodes if not is_asia(node)]
-
-    print(
-        f"\n节点分组：亚洲 {len(asia_nodes)} 个，"
-        f"其他地区 {len(other_nodes)} 个"
-    )
+    print("\n节点分组：" + "，".join(
+        f"{title} {len(group)} 个"
+        for title, group in zip(titles, groups)
+    ))
 
     def verify_group(group, title):
         if not group:
@@ -786,19 +954,37 @@ def speedtest_nodes(nodes):
         results = []
         total = len(group)
 
-        for i, node in enumerate(group, 1):
-            success, checks, latency = probe_node(
-                node,
-                checks=5,
-                timeout=6
-            )
+        print(
+            f"并发 HEAD 测试：最多 {HEAD_WORKERS} 个节点同时测试..."
+        )
 
+        probe_results = probe_nodes_parallel(
+            group,
+            checks=5,
+            timeout=6,
+        )
+
+        for index, node, success, checks, latency in probe_results:
+            i = index + 1
             rate = success / checks
+
+            # 保存最近一次稳定性测试结果。
+            # 每次重新测试稳定性时，旧的下载速度失效，
+            # 避免菜单显示不同批次的历史下载速度。
+            speedtest_cache[node["tag"]] = {
+                "success_rate": rate,
+                "latency": latency,
+                "speed": None,
+                "tested_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            save_speedtest_cache(speedtest_cache)
 
             if success == 0 or latency is None:
                 print(
                     f"[{i:02d}/{total:02d}] "
-                    f"0/{checks}   FAIL       {node['tag']}"
+                    f"{success}/{checks} "
+                    f"({rate*100:3.0f}%)  "
+                    f"FAIL       {node['tag']}"
                 )
                 continue
 
@@ -810,102 +996,82 @@ def speedtest_nodes(nodes):
                 f"{node['tag']}"
             )
 
-            results.append((rate, latency, node))
+            # 至少 4/5（80%）才允许进入下载测速候选。
+            # 不达标的节点直接淘汰，不消耗下载测速流量。
+            if rate >= 0.8:
+                results.append((rate, latency, node))
+            else:
+                print("         ↳ <80%，跳过下载测速")
 
-        # 至少 4/5（80%）才允许自动选择。
-        qualified = [
-            item for item in results
-            if item[0] >= 0.8
-        ]
-
-        qualified.sort(key=lambda x: (-x[0], x[1]))
-        return qualified
-
-    # 第一优先级：亚洲。
-    qualified = verify_group(asia_nodes, "第一阶段：亚洲节点")
-
-    if qualified:
-        print(
-            f"\n✓ 亚洲有 {len(qualified)} 个节点"
-            "达到至少 80% 成功率，不测试其他地区"
-        )
-    else:
-        print(
-            "\n! 亚洲没有节点达到 80% 成功率，"
-            "开始测试其他地区"
-        )
-        qualified = verify_group(
-            other_nodes,
-            "第二阶段：其他地区节点"
-        )
-
-    if not qualified:
-        raise RuntimeError(
-            "没有节点达到 80% 稳定性要求，保留原配置"
-        )
-
-    # 最高成功率优先。
-    best_rate = qualified[0][0]
-
-    stable = [
-        (rate, latency, node)
-        for rate, latency, node in qualified
-        if rate == best_rate
-    ]
-
-    # 同成功率下优先低延迟。
-    stable.sort(key=lambda x: x[1])
-
-    # 延迟 <= 1000 ms 的节点优先。
-    low_latency = [
-        item for item in stable
-        if item[1] <= 1.0
-    ]
-
-    if low_latency:
-        stable = low_latency
-
-    # 只取稳定性最高、延迟最低的 3 个做下载测速。
-    stable = stable[:3]
-
-    print(
-        f"\n第三阶段：下载测速 {len(stable)} 个候选"
-        f"（每节点约 {TEST_BYTES/1_000_000:.1f} MB）...\n"
-    )
+        results.sort(key=lambda x: (-x[0], x[1]))
+        return results
 
     speed_results = []
+    for title, group in zip(titles, groups):
+        if not group:
+            continue
+        qualified = verify_group(group, title)
+        if not qualified:
+            print(f"\n! {title}没有节点达到 80% 成功率，继续测试下一优先级")
+            continue
+        # 达到 80% 成功率即具备下载测速资格。
+        # 为控制测速流量，只根据轻量检测结果预筛最多 3 个候选：
+        # 成功率高优先，同成功率下延迟低优先。
+        # 最终节点由实际下载速度决定。
+        stable = sorted(
+            qualified,
+            key=lambda x: (-x[0], x[1])
+        )[:3]
 
-    for i, (rate, latency, node) in enumerate(stable, 1):
-        speed = download_test_node(node)
-
-        if speed > 0:
-            print(
-                f"[{i:02d}/{len(stable):02d}] "
-                f"{rate*100:3.0f}%  "
-                f"{latency*1000:5.0f} ms  "
-                f"{speed/1024/1024:6.2f} MB/s "
-                f"({speed*8/1_000_000:6.2f} Mbps)  "
-                f"{node['tag']}"
-            )
-            speed_results.append(
-                (rate, latency, speed, node)
-            )
-        else:
-            print(
-                f"[{i:02d}/{len(stable):02d}] "
-                f"{rate*100:3.0f}%  "
-                f"{latency*1000:5.0f} ms  "
-                f"FAIL  {node['tag']}"
-            )
-
-    if not speed_results:
-        raise RuntimeError(
-            "稳定候选下载测速全部失败，保留原配置"
+        print(
+            f"\n下载测速 {len(stable)} 个候选"
+            f"（每节点约 {TEST_BYTES/1_000_000:.1f} MB）...\n"
         )
 
-    # 稳定性第一，延迟第二，下载速度第三。
+        speed_results = []
+
+        for i, (rate, latency, node) in enumerate(stable, 1):
+            speed = download_test_node(node)
+
+            # 补充最近一次下载测速结果。
+            record = speedtest_cache.setdefault(node["tag"], {})
+            record["success_rate"] = rate
+            record["latency"] = latency
+            record["speed"] = speed if speed > 0 else None
+            record["tested_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            save_speedtest_cache(speedtest_cache)
+
+            if speed > 0:
+                print(
+                    f"[{i:02d}/{len(stable):02d}] "
+                    f"{rate*100:3.0f}%  "
+                    f"{latency*1000:5.0f} ms  "
+                    f"{speed/1024/1024:6.2f} MB/s "
+                    f"({speed*8/1_000_000:6.2f} Mbps)  "
+                    f"{node['tag']}"
+                )
+                speed_results.append(
+                    (rate, latency, speed, node)
+                )
+            else:
+                print(
+                    f"[{i:02d}/{len(stable):02d}] "
+                    f"{rate*100:3.0f}%  "
+                    f"{latency*1000:5.0f} ms  "
+                    f"FAIL  {node['tag']}"
+                )
+
+        if speed_results:
+            print(f"\n✓ 优先使用{title}")
+            break
+        print(f"\n! {title}下载测速全部失败，继续测试下一优先级")
+
+    if not speed_results:
+        raise RuntimeError("所有优先级均无稳定且下载成功的节点，保留原配置")
+
+    # 合格候选优先下载速度，其次成功率和延迟。
     speed_results.sort(
-        key=lambda x: (-x[0], x[1], -x[2])
+        key=lambda x: (-x[2], -x[0], x[1])
     )
 
     ranked_tags = {
@@ -917,6 +1083,7 @@ def speedtest_nodes(nodes):
         node for node in nodes
         if node["tag"] not in ranked_tags
     ]
+    remaining.sort(key=lambda node: node_priority(node))
 
     ordered = [
         node
@@ -975,7 +1142,7 @@ def setup():
             print(f"✓ 旧配置备份：{BACKUP}")
         os.replace(tmp, CONFIG)
         print(f"✓ 配置已保存：{CONFIG}")
-        print(f"✓ 默认最快节点：{nodes[0]['tag']}")
+        print(f"✓ 默认推荐节点：{nodes[0]['tag']}")
         git_on()
         stop(quiet=True)
         start()
@@ -1003,7 +1170,7 @@ def speedtest_existing():
 
     all_nodes = [
         x for x in cfg.get("outbounds", [])
-        if x.get("type") == "vless"
+        if x.get("type") in ("vless", "hysteria2")
     ]
 
     nodes = [
@@ -1015,7 +1182,7 @@ def speedtest_existing():
     if filtered:
         print(f"✓ 已忽略 {filtered} 个订阅信息条目")
     if not nodes:
-        print("✗ config.json 中没有 VLESS 节点")
+        print("✗ config.json 中没有 VLESS/Hysteria2 节点")
         return
     try:
         nodes = speedtest_nodes(nodes)
@@ -1033,9 +1200,312 @@ def speedtest_existing():
         return
     shutil.copy2(CONFIG, BACKUP)
     os.replace(tmp, CONFIG)
-    print(f"✓ 已切换最快节点：{nodes[0]['tag']}")
+    print(f"✓ 已切换推荐节点：{nodes[0]['tag']}")
     if find_pid():
         restart()
+
+def test_single_node(node):
+    """手动测试单个节点，并保存最近一次测试结果。"""
+    cache = load_speedtest_cache()
+    tag = node["tag"]
+
+    print(f"\n测试节点：{tag}")
+    print("稳定性测试（5 次 GitHub HEAD）...")
+
+    success, checks, latency = probe_node(
+        node,
+        checks=5,
+        timeout=6,
+    )
+    rate = success / checks
+
+    record = {
+        "success_rate": rate,
+        "latency": latency,
+        "speed": None,
+        "tested_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    cache[tag] = record
+    save_speedtest_cache(cache)
+
+    if success == 0 or latency is None:
+        print(f"✗ 稳定性测试：{success}/{checks}（{rate*100:.0f}%）")
+        print("✗ 未达到下载测速条件")
+        return
+
+    print(
+        f"✓ 稳定性：{success}/{checks} "
+        f"（{rate*100:.0f}%） | "
+        f"{latency*1000:.0f} ms"
+    )
+
+    if rate < 0.8:
+        print("! 成功率低于 80%，跳过下载测速")
+        return
+
+    print(
+        f"下载测速（约 {TEST_BYTES/1_000_000:.1f} MB）..."
+    )
+
+    speed = download_test_node(node)
+
+    record["speed"] = speed if speed > 0 else None
+    record["tested_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    save_speedtest_cache(cache)
+
+    if speed > 0:
+        print(
+            f"✓ 下载速度：{speed/1024/1024:.2f} MB/s "
+            f"({speed*8/1_000_000:.2f} Mbps)"
+        )
+    else:
+        print("✗ 下载测速失败")
+
+
+def test_node_group(group, full=False):
+    """测试当前手动选择分组。
+
+    full=False: 所有节点只做 5 次 HEAD。
+    full=True:  所有节点先做 5 次 HEAD，成功率 >=80% 的节点全部下载测速。
+    """
+    cache = load_speedtest_cache()
+    total = len(group)
+
+    if full:
+        print(
+            f"\n组内完整测试：{total} 个节点"
+            f"（5 次 HEAD；>=80% 的节点各下载约 "
+            f"{TEST_BYTES/1_000_000:.1f} MB）\n"
+        )
+    else:
+        print(
+            f"\n组内低流量测试：{total} 个节点"
+            "（每节点仅 5 次 GitHub HEAD）\n"
+        )
+
+    qualified = []
+
+    print(
+        f"并发 HEAD 测试：最多 {HEAD_WORKERS} 个节点同时测试..."
+    )
+
+    results = probe_nodes_parallel(
+        group,
+        checks=5,
+        timeout=6,
+    )
+
+    for index, node, success, checks, latency in results:
+        i = index + 1
+        rate = success / checks
+
+        cache[node["tag"]] = {
+            "success_rate": rate,
+            "latency": latency,
+            "speed": None,
+            "tested_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        save_speedtest_cache(cache)
+
+        if success == 0 or latency is None:
+            print(
+                f"[{i:02d}/{total:02d}] "
+                f"{success}/{checks} ({rate*100:3.0f}%)  "
+                f"FAIL       {node['tag']}"
+            )
+            continue
+
+        print(
+            f"[{i:02d}/{total:02d}] "
+            f"{success}/{checks} ({rate*100:3.0f}%)  "
+            f"{latency*1000:6.0f} ms   "
+            f"{node['tag']}"
+        )
+
+        # 稳定性不足的节点直接淘汰，不进入下载测速。
+        if rate >= 0.8:
+            qualified.append((rate, latency, node))
+        elif full:
+            print("         ↳ <80%，跳过下载测速")
+
+    if not full:
+        print("\n✓ 组内低流量测试完成")
+        return
+
+    if not qualified:
+        print("\n! 当前组没有节点达到 80%，跳过下载测速")
+        return
+
+    print(
+        f"\n开始下载测速：{len(qualified)} 个合格节点"
+        f"（每节点约 {TEST_BYTES/1_000_000:.1f} MB）...\n"
+    )
+
+    for i, (rate, latency, node) in enumerate(qualified, 1):
+        speed = download_test_node(node)
+
+        record = cache[node["tag"]]
+        record["speed"] = speed if speed > 0 else None
+        record["tested_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        save_speedtest_cache(cache)
+
+        if speed > 0:
+            print(
+                f"[{i:02d}/{len(qualified):02d}] "
+                f"{rate*100:3.0f}%  "
+                f"{latency*1000:5.0f} ms  "
+                f"{speed/1024/1024:6.2f} MB/s  "
+                f"{node['tag']}"
+            )
+        else:
+            print(
+                f"[{i:02d}/{len(qualified):02d}] "
+                f"FAIL  {node['tag']}"
+            )
+
+    print("\n✓ 组内完整测试完成")
+
+
+def format_speedtest_record(node, cache):
+    """格式化手动选择菜单中的最近测速数据。"""
+    record = cache.get(node["tag"])
+    if not isinstance(record, dict):
+        return "未测试"
+
+    rate = record.get("success_rate")
+    latency = record.get("latency")
+    speed = record.get("speed")
+    tested_at = record.get("tested_at", "未知时间")
+
+    if isinstance(rate, (int, float)):
+        rate_text = f"{rate * 100:.0f}%"
+    else:
+        rate_text = "--"
+
+    if isinstance(latency, (int, float)):
+        latency_text = f"{latency * 1000:.0f} ms"
+    else:
+        latency_text = "FAIL"
+
+    if isinstance(speed, (int, float)) and speed > 0:
+        speed_text = f"{speed / 1024 / 1024:.2f} MB/s"
+    else:
+        speed_text = "未测速"
+
+    return (
+        f"{rate_text} | {latency_text} | "
+        f"{speed_text} | {tested_at}"
+    )
+
+
+def choose_node():
+    require_root()
+    ensure_binary()
+    if not CONFIG.exists():
+        print("✗ 没有配置，请先运行 sb setup")
+        return
+    try:
+        cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
+        selector = next((x for x in cfg.get("outbounds", [])
+                         if x.get("type") == "selector" and x.get("tag") == "proxy"), None)
+        if selector is None:
+            print("✗ 配置中没有 proxy 选择器")
+            return
+        allowed = selector.get("outbounds", [])
+        groups = [[] for _ in NODE_GROUP_TITLES]
+        for node in cfg.get("outbounds", []):
+            if node.get("type") in ("vless", "hysteria2") and node.get("tag") in allowed:
+                groups[node_priority(node)].append(node)
+        available = [(title, group) for title, group in zip(NODE_GROUP_TITLES, groups) if group]
+        if not available:
+            print("✗ 没有可选择的 VLESS/Hysteria2 节点")
+            return
+        while True:
+            print(f"\n当前默认节点：{selector.get('default', '未设置')}")
+            print("节点分组")
+            for i, (title, group) in enumerate(available, 1):
+                branch = "└─" if i == len(available) else "├─"
+                print(f"{branch} [{i}] {title}（{len(group)} 个）")
+            value = input("选择分组编号（0 退出）：").strip()
+            if value == "0":
+                return
+            if not value.isdecimal() or not 1 <= int(value) <= len(available):
+                print("请输入有效的分组编号")
+                continue
+            title, group = available[int(value) - 1]
+            while True:
+                cache = load_speedtest_cache()
+
+                print(f"\n========== {title} ==========")
+                print(f"当前默认节点：{selector.get('default', '未设置')}\n")
+
+                for i, node in enumerate(group, 1):
+                    mark = " ✓ 当前默认" if node["tag"] == selector.get("default") else ""
+                    print(f"[{i}] {node['tag']}{mark}")
+                    print(f"    {format_speedtest_record(node, cache)}")
+
+                print("""
+---------- 操作说明 ----------
+1 / 2 / ...   直接切换节点
+t 1           完整测试指定节点
+l             组内低流量测试（全部节点仅 5×HEAD）
+r             组内完整测试（全部节点 5×HEAD，>=80% 全部下载测速）
+0             返回分组
+q             退出
+""")
+
+                value = input("请输入操作：").strip().lower()
+
+                if value == "0":
+                    break
+
+                if value == "q":
+                    return
+
+                if value == "l":
+                    test_node_group(group, full=False)
+                    continue
+
+                if value == "r":
+                    test_node_group(group, full=True)
+                    continue
+
+                match = re.fullmatch(r"t\s+(\d+)", value)
+                if match:
+                    index = int(match.group(1))
+                    if not 1 <= index <= len(group):
+                        print("请输入有效的节点编号")
+                        continue
+
+                    test_single_node(group[index - 1])
+                    continue
+
+                if not value.isdecimal() or not 1 <= int(value) <= len(group):
+                    print("请输入有效操作")
+                    continue
+
+                selected = group[int(value) - 1]["tag"]
+                selector['default'] = selected
+                tmp = CONFIG_DIR / "config.json.new"
+                save_config(cfg, tmp)
+                if not check_config(tmp):
+                    tmp.unlink(missing_ok=True)
+                    print("✗ 新配置检查失败；原配置未修改")
+                    return
+                shutil.copy2(CONFIG, BACKUP)
+                os.replace(tmp, CONFIG)
+                print(f"✓ 已选择节点：{selected}")
+                print(f"✓ 旧配置已备份：{BACKUP}")
+                if find_pid():
+                    restart()
+                else:
+                    start()
+                return
+    except (EOFError, KeyboardInterrupt):
+        print("\n已取消选择")
+    except Exception as e:
+        print(f"✗ 手动选择失败：{e}")
+
 
 def version():
     print(f"sb {SB_VERSION}")
@@ -1066,6 +1536,8 @@ AutoDL 首次安装：
   sb setup        输入订阅、智能测速、生成配置并启动
   sb update       重新输入订阅并完整更新
   sb speedtest    低流量筛选稳定节点并自动切换
+  sb select       按分组树状菜单手动选择节点
+  sb switch       select 的别名，手动选择节点
 
 运行管理：
   sb start        启动
@@ -1096,6 +1568,8 @@ def main():
     commands = {
         "install": install, "uninstall": uninstall, "version": version,
         "setup": setup, "update": setup, "speedtest": speedtest_existing,
+        "select": choose_node,
+        "switch": choose_node,
         "start": start, "stop": stop, "restart": restart,
         "status": status, "test": test, "log": show_log,
         "git-on": git_on, "git-off": git_off, "help": help_text,
